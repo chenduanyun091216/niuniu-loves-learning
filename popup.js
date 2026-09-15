@@ -3,11 +3,48 @@ const fillEl = document.getElementById('progress-fill');
 const progText = document.getElementById('progress-text');
 const startBtn = document.getElementById('start');
 const stopBtn = document.getElementById('stop');
+const settingsBtn = document.getElementById('settings-btn');
+const settingsBackBtn = document.getElementById('settings-back');
+const mainView = document.getElementById('main-view');
+const settingsView = document.getElementById('settings-view');
+const speedCurrentEl = document.getElementById('speed-current');
+
+const SPEED_PRESETS = {
+  fast: { label: '快速', waitMin: 500, waitMax: 1000, studyMin: 35, studyMax: 50 },
+  balanced: { label: '均衡', waitMin: 1000, waitMax: 1500, studyMin: 25, studyMax: 40 },
+  slow: { label: '慢速', waitMin: 1000, waitMax: 2000, studyMin: 10, studyMax: 30 }
+};
+const DEFAULT_SPEED_MODE = 'balanced';
 
 let running = false;
 let activeRunId = null;
 let lastLogIndex = 0;
 let polling = false;
+let speedMode = DEFAULT_SPEED_MODE;
+
+function setSettingsView(showSettings) {
+  mainView.hidden = showSettings;
+  settingsView.hidden = !showSettings;
+  settingsBtn.setAttribute('aria-label', showSettings ? '返回主页面' : '设置');
+  settingsBtn.title = showSettings ? '返回主页面' : '设置';
+  if (showSettings) renderSpeedMode();
+}
+
+function renderSpeedMode() {
+  const preset = SPEED_PRESETS[speedMode] || SPEED_PRESETS[DEFAULT_SPEED_MODE];
+  document.querySelectorAll('input[name="speed-mode"]').forEach(input => {
+    input.checked = input.value === speedMode;
+  });
+  speedCurrentEl.textContent = `当前速度：${preset.label}`;
+}
+
+const speedReady = new Promise(resolve => {
+  chrome.storage.local.get({ speedMode: DEFAULT_SPEED_MODE }, result => {
+    if (SPEED_PRESETS[result.speedMode]) speedMode = result.speedMode;
+    renderSpeedMode();
+    resolve();
+  });
+});
 
 function log(msg, type) {
   const now = new Date();
@@ -41,7 +78,13 @@ function appendBrushLogs(state) {
 }
 
 // 在页面 MAIN world 中执行的函数（字符串化后注入）
-const pageFunc = (runId) => {
+const pageFunc = (runId, speedMode) => {
+  const speedPresets = {
+    fast: { waitMin: 500, waitMax: 1000, studyMin: 35, studyMax: 50 },
+    balanced: { waitMin: 1000, waitMax: 1500, studyMin: 25, studyMax: 40 },
+    slow: { waitMin: 1000, waitMax: 2000, studyMin: 10, studyMax: 30 }
+  };
+
   function emit(state, msg, type) {
     state.logs.push({ msg, type });
     state.updatedAt = Date.now();
@@ -65,7 +108,8 @@ const pageFunc = (runId) => {
   // 等待 store 和 fileList 就绪
   return new Promise(async (resolve) => {
     const state = {
-      runId, logs: [], total: 0, done: 0, ok: 0, fail: 0,
+      runId, speedMode: speedPresets[speedMode] ? speedMode : 'balanced',
+      logs: [], total: 0, done: 0, ok: 0, fail: 0,
       stopped: false, finished: false, updatedAt: Date.now()
     };
     const pendingStop = window.__ksx_stopRequested === runId;
@@ -115,15 +159,20 @@ const pageFunc = (runId) => {
     const courseName = store.state.videoDetail.courseInfo.documentsData?.courseName || '';
     // https://exam.kaoshixing.com/staff_course/excute
     // 仅使用本地mock地址，严禁直接调取真实接口，只用于测试学习
-//     const executeUrl = 'https://Mymock/test';
-    const executeUrl = 'https://exam.kaoshixing.com/staff_course/excute';
+     const executeUrl = 'https://Mymock/test';
+//    const executeUrl = 'https://exam.kaoshixing.com/staff_course/excute';
 
-    const waitRandom = () => new Promise(x => setTimeout(x, Math.floor(Math.random() * 1001) + 1000));
     const executeRequest = (payload, controller, headers) => fetch(executeUrl, {
       method: 'POST', credentials: 'include',
       headers,
       body: JSON.stringify(payload), signal: controller.signal
     });
+    const getSpeed = () => speedPresets[state.speedMode] || speedPresets.balanced;
+    const randomBetween = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+    const waitRandom = () => {
+      const speed = getSpeed();
+      return new Promise(x => setTimeout(x, randomBetween(speed.waitMin, speed.waitMax)));
+    };
 
     const todo = fileList.filter(f => (f.finishPercent || 0) < 100);
     const needsMediaParams = todo.some(f => [1, 2].includes(Number(f.fileType)));
@@ -254,7 +303,8 @@ const pageFunc = (runId) => {
         if (state.stopped) break;
 
         chunkNo++;
-        const studyTime = Math.floor(Math.random() * 21) + 10;
+        const speed = getSpeed();
+        const studyTime = randomBetween(speed.studyMin, speed.studyMax);
         lastPlace = Math.round((lastPlace + studyTime / 2) * 1000000) / 1000000;
         let accepted = false;
 
@@ -336,6 +386,48 @@ async function getTab() {
   return tab;
 }
 
+async function syncRunningSpeed(mode) {
+  if (!running || !activeRunId) return;
+  const tab = await getTab();
+  if (!tab?.id) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id }, world: 'MAIN',
+      func: (runId, nextMode, label) => {
+        const state = window.__ksx_brushState;
+        if (!state || state.runId !== runId || state.finished) return;
+        state.speedMode = nextMode;
+        state.updatedAt = Date.now();
+        state.logs.push({ msg: `速度已切换为${label}`, type: 'INFO' });
+      },
+      args: [activeRunId, mode, SPEED_PRESETS[mode].label]
+    });
+  } catch (e) {}
+}
+
+async function restoreBrushState() {
+  const tab = await getTab();
+  if (!tab?.id) return false;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id }, world: 'MAIN',
+      func: () => window.__ksx_brushState || null
+    });
+    const state = results?.[0]?.result;
+    if (!state?.runId) return false;
+    activeRunId = state.runId;
+    lastLogIndex = 0;
+    logEl.innerHTML = '';
+    appendBrushLogs(state);
+    running = !state.finished;
+    startBtn.disabled = running;
+    stopBtn.disabled = !running || state.stopped;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function startBrush() {
   if (running) return;
   running = true;
@@ -345,6 +437,7 @@ async function startBrush() {
   stopBtn.disabled = false;
   logEl.innerHTML = '';
   setProgress(0, 0);
+  await speedReady;
 
   const tab = await getTab();
   if (!tab?.id) {
@@ -362,7 +455,7 @@ async function startBrush() {
       target: { tabId: tab.id },
       world: 'MAIN',
       func: pageFunc,
-      args: [activeRunId]
+      args: [activeRunId, speedMode]
     });
     result = results?.[0]?.result;
   } catch (e) {
@@ -419,6 +512,25 @@ stopBtn.addEventListener('click', async () => {
 
 startBtn.addEventListener('click', startBrush);
 
+settingsBtn.addEventListener('click', () => {
+  setSettingsView(settingsView.hidden);
+});
+
+settingsBackBtn.addEventListener('click', () => {
+  setSettingsView(false);
+});
+
+document.querySelectorAll('input[name="speed-mode"]').forEach(input => {
+  input.addEventListener('change', () => {
+    const nextMode = input.value;
+    if (!SPEED_PRESETS[nextMode]) return;
+    speedMode = nextMode;
+    chrome.storage.local.set({ speedMode });
+    renderSpeedMode();
+    syncRunningSpeed(nextMode);
+  });
+});
+
 // 轮询进度（MAIN world 写入 window.__ksx_progress）
 setInterval(async () => {
   if (!running || polling) return;
@@ -435,4 +547,8 @@ setInterval(async () => {
   polling = false;
 }, 1500);
 
-log('就绪。请进入视频播放页后点「开始学习」', 'INFO');
+(async () => {
+  await speedReady;
+  const restored = await restoreBrushState();
+  if (!restored) log('就绪。请进入视频播放页后点「开始学习」', 'INFO');
+})();
