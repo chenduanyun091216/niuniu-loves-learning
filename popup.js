@@ -159,8 +159,8 @@ const pageFunc = (runId, speedMode) => {
     const courseName = store.state.videoDetail.courseInfo.documentsData?.courseName || '';
     // https://exam.kaoshixing.com/staff_course/excute
     // 仅使用本地mock地址，严禁直接调取真实接口，只用于测试学习
-     const executeUrl = 'https://Mymock/test';
-//    const executeUrl = 'https://exam.kaoshixing.com/staff_course/excute';
+//     const executeUrl = 'https://Mymock/test';
+    const executeUrl = 'https://exam.kaoshixing.com/staff_course/excute';
 
     const executeRequest = (payload, controller, headers) => fetch(executeUrl, {
       method: 'POST', credentials: 'include',
