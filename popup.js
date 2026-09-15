@@ -106,16 +106,33 @@ const pageFunc = (runId) => {
     const routeQuery = location.search || ((location.hash || '').split('?')[1] || '');
     const up = new URLSearchParams(routeQuery);
     const popProcessId = up.get('popProcessId') || store.state?.examProcessInfo?.processInfo?.id || '';
+    const courseId = store.state?.videoDetail?.courseInfo?.courseId
+      || store.state?.videoDetail?.courseInfo?.documentsData?.courseId
+      || store.state?.videoDetail?.courseInfo?.documentsData?.id
+      || store.state?.courseId
+      || up.get('courseId')
+      || '';
     const courseName = store.state.videoDetail.courseInfo.documentsData?.courseName || '';
+    // https://exam.kaoshixing.com/staff_course/excute
+    // 仅使用本地mock地址，严禁直接调取真实接口，只用于测试学习
+//     const executeUrl = 'https://Mymock/test';
     const executeUrl = 'https://exam.kaoshixing.com/staff_course/excute';
 
-    if (!token || userId == null || !popProcessId) {
+    const waitRandom = () => new Promise(x => setTimeout(x, Math.floor(Math.random() * 1001) + 1000));
+    const executeRequest = (payload, controller, headers) => fetch(executeUrl, {
+      method: 'POST', credentials: 'include',
+      headers,
+      body: JSON.stringify(payload), signal: controller.signal
+    });
+
+    const todo = fileList.filter(f => (f.finishPercent || 0) < 100);
+    const needsMediaParams = todo.some(f => [1, 2].includes(Number(f.fileType)));
+    if (!token || userId == null || (needsMediaParams && !popProcessId)) {
       state.finished = true;
       emit(state, '❌ 未获取完整接口参数，请刷新课程页面后重试', 'ERROR');
       return resolve({ ...state, error: 'MISSING_PARAMS', courseName, total: fileList.length, todoCount: 0 });
     }
 
-    const todo = fileList.filter(f => (f.finishPercent || 0) < 100);
     state.total = todo.length;
     emit(state, `开始自动执行 ${courseName || '当前课程'}`);
     if (todo.length === 0) {
@@ -126,26 +143,118 @@ const pageFunc = (runId) => {
       return resolve({ ...state, ok: true, courseName, total: fileList.length, todoCount: 0 });
     }
 
+    async function studyCourseFile(file, kind) {
+      if (!courseId || file.fileId == null) {
+        emit(state, `  ❌ ${kind}缺少 courseId 或 fileId，无法提交`, 'ERROR');
+        return false;
+      }
+
+      for (let tryN = 1; tryN <= 3; tryN++) {
+        if (state.stopped) return false;
+        await waitRandom();
+        if (state.stopped) return false;
+
+        const controller = new AbortController();
+        window.__ksx_abortBrush = controller;
+        try {
+          const r = await executeRequest({
+            token, userId, methodName: 'studyCourseFile',
+            jsonParam: { courseId: String(courseId), fileId: file.fileId }
+          }, controller, {
+            'Accept': 'application/json, text/plain, */*',
+            'Content-Type': 'application/x-www-form-urlencoded'
+          });
+          const raw = await r.text();
+          let d;
+          try {
+            d = JSON.parse(raw);
+          } catch (e) {
+            const isXmlOrHtml = /^\s*</.test(raw);
+            const detail = isXmlOrHtml ? 'XML/HTML' : raw.trim() ? '非JSON响应' : '空响应';
+            emit(state, `  ❌ ${kind}接口返回${detail}（HTTP ${r.status}），重试${tryN}`, 'ERROR');
+            continue;
+          }
+
+          const msg = d.message || d.englishMessage || '';
+          if (d.code === 200 || d.code === 0 || msg === 'OK' || msg === '一切正常') {
+            const biz = d.data?.bizContent || {};
+            if (biz.studyRecordFileId != null && biz.studyRecordFileId !== '') {
+              file.studyRecordFileId = biz.studyRecordFileId;
+            }
+            if (biz.studyMap?.isFinished === true) file.finishPercent = 100;
+            return true;
+          }
+          emit(state, `  ⚠️ ${kind}业务异常 code=${d.code} msg=${msg} 重试${tryN}`, 'WARN');
+        } catch (e) {
+          if (state.stopped || e.name === 'AbortError') return false;
+          emit(state, `  ❌ ${kind}异常 ${e.message} 重试${tryN}`, 'ERROR');
+        } finally {
+          if (window.__ksx_abortBrush === controller) window.__ksx_abortBrush = null;
+        }
+        if (tryN < 3 && !state.stopped) await waitRandom();
+      }
+      return false;
+    }
+
+    async function studyDocument(file) {
+      const accepted = await studyCourseFile(file, '文档');
+      if (accepted) emit(state, `  ✅ 文档接口处理成功（fileId=${file.fileId}）`, 'SUCCESS');
+      return accepted;
+    }
+
     for (let i = 0; i < todo.length; i++) {
       if (state.stopped) break;
       await new Promise(x => setTimeout(x, 0));
       if (state.stopped) break;
       const f = todo[i];
-      const fid = f.studyRecordFileId;
+      let fid = f.studyRecordFileId;
       const fname = f.fileName || '未知文件';
+      const fileType = Number(f.fileType);
       const st = Math.round(f.fileTime || 3600);
-      emit(state, `[${i + 1}/${todo.length}] ${fname} (id=${fid}) 时长=${st}s 当前${f.finishPercent || 0}%`);
+      const fileKind = fileType === 0 ? '文档' : fileType === 1 ? '视频' : fileType === 2 ? '音频' : '未知';
+      emit(state, `[${i + 1}/${todo.length}] ${fname} 类型=${fileKind} (id=${fid})${fileType === 0 ? '' : ` 时长=${st}s`} 当前${f.finishPercent || 0}%`);
+
+      if (fileType === 0) {
+        const accepted = await studyDocument(f);
+        if (state.stopped) break;
+        if (accepted) state.ok++;
+        else state.fail++;
+        state.done = state.ok + state.fail;
+        window.__ksx_progress = { done: state.done, total: state.total, ok: state.ok, fail: state.fail };
+        continue;
+      }
+      if (fileType !== 1 && fileType !== 2) {
+        state.fail++;
+        state.done = state.ok + state.fail;
+        emit(state, `  ❌ 不支持的课程类型 fileType=${f.fileType}`, 'ERROR');
+        window.__ksx_progress = { done: state.done, total: state.total, ok: state.ok, fail: state.fail };
+        continue;
+      }
+
+      if (!fid) {
+        const initialized = await studyCourseFile(f, '媒体');
+        if (state.stopped) break;
+        fid = f.studyRecordFileId;
+        if (!initialized || !fid) {
+          state.fail++;
+          state.done = state.ok + state.fail;
+          emit(state, '  ❌ 未获取媒体 studyRecordFileId，结束当前章节', 'ERROR');
+          window.__ksx_progress = { done: state.done, total: state.total, ok: state.ok, fail: state.fail };
+          continue;
+        }
+        emit(state, `  ✅ 已获取媒体学习记录（studyRecordFileId=${fid}）`, 'SUCCESS');
+      }
 
       let finishedChapter = false;
       let failed = false;
       let lastPlace = 0;
       let chunkNo = 0;
       while (!state.stopped && !finishedChapter) {
-        await new Promise(x => setTimeout(x, 1000));
+        await waitRandom();
         if (state.stopped) break;
 
         chunkNo++;
-        const studyTime = Math.floor(Math.random() * 31) + 20;
+        const studyTime = Math.floor(Math.random() * 21) + 10;
         lastPlace = Math.round((lastPlace + studyTime / 2) * 1000000) / 1000000;
         let accepted = false;
 
@@ -154,13 +263,12 @@ const pageFunc = (runId) => {
           const controller = new AbortController();
           window.__ksx_abortBrush = controller;
           try {
-            const r = await fetch(executeUrl, {
-              method: 'POST', credentials: 'include',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                token, userId, methodName: 'updateFileStudyTime',
-                jsonParam: { studyRecordFileId: fid, studyTime, lastPlace, popProcessId }
-              }), signal: controller.signal
+            const r = await executeRequest({
+              token, userId, methodName: 'updateFileStudyTime',
+              jsonParam: { studyRecordFileId: fid, studyTime, lastPlace, popProcessId }
+            }, controller, {
+              'Accept': 'application/json, text/plain, */*',
+              'Content-Type': 'application/x-www-form-urlencoded'
             });
             const raw = await r.text();
             let d;
@@ -196,7 +304,7 @@ const pageFunc = (runId) => {
           } finally {
             if (window.__ksx_abortBrush === controller) window.__ksx_abortBrush = null;
           }
-          if (!accepted && !state.stopped && tryN < 3) await new Promise(x => setTimeout(x, 2000));
+          if (!accepted && !state.stopped && tryN < 3) await waitRandom();
         }
 
         if (state.stopped) break;
