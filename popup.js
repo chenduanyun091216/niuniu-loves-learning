@@ -9,6 +9,9 @@ const mainView = document.getElementById('main-view');
 const settingsView = document.getElementById('settings-view');
 const speedCurrentEl = document.getElementById('speed-current');
 
+const mainViewHeight = Math.ceil(mainView.getBoundingClientRect().height);
+document.documentElement.style.setProperty('--body-min-height', `${mainViewHeight}px`);
+
 const SPEED_PRESETS = {
   fast: { label: '快速', waitMin: 500, waitMax: 1000, studyMin: 35, studyMax: 50 },
   balanced: { label: '均衡', waitMin: 1000, waitMax: 1500, studyMin: 25, studyMax: 40 },
